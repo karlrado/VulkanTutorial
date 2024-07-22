@@ -177,6 +177,11 @@ private:
     VkImageView textureImageView;
     VkSampler textureSampler;
 
+    VkImage texture2Image = VK_NULL_HANDLE;
+    VkDeviceMemory texture2ImageMemory;
+    VkImageView texture2ImageView;
+    VkSampler texture2Sampler;
+
     VkBuffer vertexBuffer;
     VkDeviceMemory vertexBufferMemory;
     VkBuffer indexBuffer;
@@ -195,6 +200,7 @@ private:
     std::vector<VkSemaphore> renderFinishedSemaphores;
     std::vector<VkFence> inFlightFences;
     uint32_t currentFrame = 0;
+    uint32_t lastImageIndex = 0;
 
     bool framebufferResized = false;
 
@@ -283,6 +289,9 @@ private:
 
         vkDestroyImage(device, textureImage, nullptr);
         vkFreeMemory(device, textureImageMemory, nullptr);
+
+        vkDestroyImage(device, texture2Image, nullptr);
+        vkFreeMemory(device, texture2ImageMemory, nullptr);
 
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 
@@ -1291,11 +1300,147 @@ private:
         memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
     }
 
+    // https://stackoverflow.com/questions/78775586/how-to-pass-previous-frame-as-sampler2d-to-fragment-shader-in-vulkan
+    
+    VkImage getImage() {
+        if (texture2Image == VK_NULL_HANDLE) {
+            createImage(swapChainExtent.width, swapChainExtent.height, VK_FORMAT_B8G8R8A8_SRGB, VK_IMAGE_TILING_OPTIMAL,
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, texture2Image, texture2ImageMemory);
+        }
+        return texture2Image;
+}
+
+    void texture(int curImageIndex) {
+        VkImage textureImage = getImage(); // destination image
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkImageMemoryBarrier barrierSwapchainToTransfer = {};
+        barrierSwapchainToTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrierSwapchainToTransfer.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;  // was: UNDEFINED
+        barrierSwapchainToTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrierSwapchainToTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrierSwapchainToTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrierSwapchainToTransfer.image = swapChainImages[curImageIndex];
+        barrierSwapchainToTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrierSwapchainToTransfer.subresourceRange.baseMipLevel = 0;
+        barrierSwapchainToTransfer.subresourceRange.levelCount = 1;
+        barrierSwapchainToTransfer.subresourceRange.baseArrayLayer = 0;
+        barrierSwapchainToTransfer.subresourceRange.layerCount = 1;
+        barrierSwapchainToTransfer.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;  // was: NONE
+        barrierSwapchainToTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT; 
+
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,  // was: TOP, TRANSFER
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &barrierSwapchainToTransfer
+        );
+
+        VkImageMemoryBarrier barrierTextureToTransfer = {};
+        barrierTextureToTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrierTextureToTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrierTextureToTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrierTextureToTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrierTextureToTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrierTextureToTransfer.image = textureImage;
+        barrierTextureToTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrierTextureToTransfer.subresourceRange.baseMipLevel = 0;
+        barrierTextureToTransfer.subresourceRange.levelCount = 1;
+        barrierTextureToTransfer.subresourceRange.baseArrayLayer = 0;
+        barrierTextureToTransfer.subresourceRange.layerCount = 1;
+        barrierTextureToTransfer.srcAccessMask = VK_ACCESS_NONE_KHR;
+        barrierTextureToTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,  // was: TOP, TRANSFER
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &barrierTextureToTransfer
+        );
+
+        VkImageCopy copyRegion = {};
+        copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.srcSubresource.mipLevel = 0;
+        copyRegion.srcSubresource.baseArrayLayer = 0;
+        copyRegion.srcSubresource.layerCount = 1;
+        copyRegion.srcOffset = { 0, 0, 0 };
+        copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.dstSubresource.mipLevel = 0;
+        copyRegion.dstSubresource.baseArrayLayer = 0;
+        copyRegion.dstSubresource.layerCount = 1;
+        copyRegion.dstOffset = { 0, 0, 0 };
+        copyRegion.extent = { swapChainExtent.width, swapChainExtent.height, 1 };
+
+        vkCmdCopyImage(
+            commandBuffer,
+            swapChainImages[curImageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            textureImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &copyRegion
+        );
+
+        VkImageMemoryBarrier barrierTextureToShaderRead = {};
+        barrierTextureToShaderRead.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrierTextureToShaderRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrierTextureToShaderRead.newLayout = VK_IMAGE_LAYOUT_GENERAL;// VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrierTextureToShaderRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrierTextureToShaderRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrierTextureToShaderRead.image = textureImage;
+        barrierTextureToShaderRead.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrierTextureToShaderRead.subresourceRange.baseMipLevel = 0;
+        barrierTextureToShaderRead.subresourceRange.levelCount = 1;
+        barrierTextureToShaderRead.subresourceRange.baseArrayLayer = 0;
+        barrierTextureToShaderRead.subresourceRange.layerCount = 1;
+        barrierTextureToShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrierTextureToShaderRead.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;//VK_ACCESS_SHADER_READ_BIT;
+
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,  // was: TRANSFER, FRAGMENT_SHADER
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &barrierTextureToShaderRead
+        );
+
+        VkImageMemoryBarrier barrierSwapchainToPresent = {};
+        barrierSwapchainToPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrierSwapchainToPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrierSwapchainToPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrierSwapchainToPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrierSwapchainToPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrierSwapchainToPresent.image = swapChainImages[curImageIndex];
+        barrierSwapchainToPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrierSwapchainToPresent.subresourceRange.baseMipLevel = 0;
+        barrierSwapchainToPresent.subresourceRange.levelCount = 1;
+        barrierSwapchainToPresent.subresourceRange.baseArrayLayer = 0;
+        barrierSwapchainToPresent.subresourceRange.layerCount = 1;
+        barrierSwapchainToPresent.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrierSwapchainToPresent.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,  // was: TRANSFER, BOTTOM
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &barrierSwapchainToPresent
+        );
+
+        endSingleTimeCommands(commandBuffer);;
+    }
+
     void drawFrame() {
         vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
 
+        // texture(lastImageIndex);
+
         uint32_t imageIndex;
         VkResult result = vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+        lastImageIndex = imageIndex;
 
         if (result == VK_ERROR_OUT_OF_DATE_KHR) {
             recreateSwapChain();
@@ -1330,6 +1475,8 @@ private:
         if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]) != VK_SUCCESS) {
             throw std::runtime_error("failed to submit draw command buffer!");
         }
+        vkQueueWaitIdle(graphicsQueue);
+        texture(imageIndex);
 
         VkPresentInfoKHR presentInfo{};
         presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
